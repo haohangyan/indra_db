@@ -334,7 +334,29 @@ def old_search():
 @app.route("/metadata/<result_type>/<path:method>", methods=["GET", "POST"])
 @user_log_endpoint
 def get_statements(result_type, method):
-    """Get some statements constrained by query."""
+    """Get some statements constrained by query
+
+    Constraints:
+    - Agents involved
+    - statement hashes
+    - paper ids (PMC/PMID, DOI...)
+    - agent json (Used in RelationSearch.vue)
+
+    Possible result types:
+    - statements
+    - interactions
+    - agents
+    - hashes
+
+    Possible methods:
+    - from_agents
+    - from_hashes
+    - from_hash/<hash>
+    - from_papers
+    - from_paper/<paper_id>
+    - from_agent_json
+    - from_simple_json
+    """
     if result_type not in ApiCall.valid_result_types:
         return Response("Page not found.", 404)
 
@@ -347,7 +369,7 @@ def get_statements(result_type, method):
         call = FromHashesApiCall(env)
     elif method.startswith("from_hash/") and request.method == "GET":
         call = FromHashApiCall(env)
-        call.web_query["hash"] = method[len("from_hash/") :]
+        call.web_query["hash"] = method[len("from_hash/"):]
     elif method == "from_papers" and request.method == "POST":
         call = FromPapersApiCall(env)
     elif method.startswith("from_paper/") and request.method == "GET":
@@ -372,6 +394,8 @@ def get_statements(result_type, method):
 
 @app.route("/expand", methods=["POST"])
 def expand_meta_row():
+    # Used in AgentPair.vue when an "agent pair" is expanded and that level
+    # of data needs to be fetched.
     start_time = datetime.now()
 
     # Get the agent_json and hashes
@@ -465,6 +489,7 @@ def expand_meta_row():
 @app.route("/query/<result_type>", methods=["GET", "POST"])
 @user_log_endpoint
 def get_statements_by_query_json(result_type):
+    # Used in indra_db_rest in indra
     note_in_log(result_type=result_type)
     try:
         return DirectQueryApiCall(env).run(result_type)
@@ -474,6 +499,7 @@ def get_statements_by_query_json(result_type):
 
 @app.route("/compile/<fmt>", methods=["POST"])
 def compile_query(fmt):
+    # Used in indra_db_rest in indra
     if pop_request_bool(dict(request.args), "simple", True):
         q = Query.from_simple_json(request.json)
     else:
@@ -488,6 +514,7 @@ def compile_query(fmt):
 
 @app.route("/curation", methods=["GET"])
 def describe_curation():
+    # Used in indra_db_rest in indra
     return redirect("/statements", code=302)
 
 
