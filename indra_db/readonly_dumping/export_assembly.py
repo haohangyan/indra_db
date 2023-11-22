@@ -1,3 +1,4 @@
+import argparse
 import csv
 import gzip
 import itertools
@@ -6,7 +7,7 @@ import logging
 import math
 import pickle
 from collections import defaultdict, Counter
-from typing import Tuple, Set, Dict, List
+from typing import Tuple, Set, Dict, List, Optional
 
 import networkx as nx
 import numpy as np
@@ -21,6 +22,8 @@ from indra.statements import stmts_from_json, stmt_from_json, Statement, \
     Evidence
 from indra.util import batch_iter
 from indra.tools import assemble_corpus as ac
+
+from indra_db.cli.knowledgebase import KnowledgebaseManager, local_update
 from .util import clean_json_loads
 from .locations import *
 
@@ -280,16 +283,82 @@ def distill_statements() -> Tuple[Set, Dict]:
     return drop_readings, reading_id_to_text_ref_id
 
 
-def preassembly(drop_readings: Set, reading_id_to_text_ref_id: Dict):
-    if not processed_stmts_fpath.exists() or not source_counts_fpath.exists():
+def run_kb_pipeline(refresh: bool) -> Dict[int, Path]:
+    """Run the knowledgebase pipeline
+
+    Parameters
+    ----------
+    refresh :
+        If True, generate new statements for each knowledgebase manager and
+        overwrite any local files. If False (default), the local files will
+        be used if they exist.
+
+    Returns
+    -------
+    :
+        A dictionary mapping db_info ids to the local file paths of the
+        statements for that knowledgebase
+    """
+    from indra_db.util import get_db
+    db = get_db('primary')
+
+    res = db.select_all(db.DBInfo)
+    kb_mapping = {(r.source_api, r.db_name): r.id for r in res}
+
+    # Select all knowledgebase managers except HPRD: statements already
+    # exist in db, the source data hasn't been updated since 2009 and the
+    # server hosting the source data returns 500 errors when trying to
+    # download it
+    selected_kbs = []
+    kb_file_mapping = {}
+    for M in KnowledgebaseManager.__subclasses__():
+        m = M()
+        if m.short_name != "hprd":
+            db_id = kb_mapping.get((m.source, m.short_name))
+            if db_id is None:
+                raise ValueError(
+                    f"Could not find db_id for {m.source} {m.short_name} "
+                    f"in the db_info table on the principal database. Please "
+                    f"add it."
+                )
+            selected_kbs.append(M)
+            kb_file_mapping[db_id] = m.get_local_fpath()
+
+    local_update(kb_manager_list=selected_kbs, refresh=refresh)
+
+    return kb_file_mapping
+
+
+def preassembly(
+    drop_readings: Set[int],
+    reading_id_to_text_ref_id: Dict,
+    drop_db_info_ids: Optional[Set[int]] = None,
+):
+    # Todo:
+    #  - parallelize, i.e. run different batches in different threads (can
+    #    they write to the same file? If not, have them write to
+    #    different files that are concatenated after all threads are done)
+    """Preassemble statements and collect source counts
+
+    Parameters
+    ----------
+    drop_readings :
+        A set of reading ids to drop
+    reading_id_to_text_ref_id :
+        A dictionary mapping reading ids to text ref ids
+    drop_db_info_ids :
+        A set of db_info ids to drop
+    """
+    if (
+        not processed_stmts_reading_fpath.exists() or
+        not source_counts_reading_fpath.exists()
+    ):
         logger.info("Preassembling statements and collecting source counts")
         text_refs = load_text_refs_by_trid(text_refs_fpath.as_posix())
-        source_counts = defaultdict(lambda: defaultdict(int))
+        source_counts = defaultdict(Counter)
         stmt_hash_to_raw_stmt_ids = defaultdict(set)
-        # Todo:
-        #  - parallelize
         with gzip.open(raw_statements_fpath.as_posix(), "rt") as fh, \
-                gzip.open(processed_stmts_fpath.as_posix(), "wt") as fh_out, \
+                gzip.open(processed_stmts_reading_fpath.as_posix(), "wt") as fh_out, \
                 gzip.open(raw_id_info_map_fpath.as_posix(), "wt") as fh_info:
             raw_stmts_reader = csv.reader(fh, delimiter="\t")
             writer = csv.writer(fh_out, delimiter="\t")
@@ -302,9 +371,12 @@ def preassembly(drop_readings: Set, reading_id_to_text_ref_id: Dict):
                     raw_stmt_id_int = int(raw_stmt_id)
                     db_info_id = int(db_info_id) if db_info_id != "\\N" else None
                     refs = None
-                    int_reading_id = None
+
+                    # Skip if this is for a dropped knowledgebase or reading
+                    if drop_db_info_ids and db_info_id and \
+                            db_info_id in drop_db_info_ids:
+                        continue
                     if reading_id != "\\N":
-                        # Skip if this is for a dropped reading
                         int_reading_id = int(reading_id)
                         if int_reading_id in drop_readings:
                             continue
@@ -313,7 +385,7 @@ def preassembly(drop_readings: Set, reading_id_to_text_ref_id: Dict):
                             refs = text_refs.get(text_ref_id)
 
                     # Append to info rows
-                    info_rows.append((raw_stmt_id_int, db_info_id,
+                    info_rows.append((raw_stmt_id_int, db_info_id or "\\N",
                                       int_reading_id, stmt_json_raw))
                     stmt_json = clean_json_loads(stmt_json_raw)
                     if refs:
@@ -342,10 +414,10 @@ def preassembly(drop_readings: Set, reading_id_to_text_ref_id: Dict):
                 rows = [(stmt.get_hash(), json.dumps(stmt.to_json())) for stmt in stmts]
                 writer.writerows(rows)
 
-        # Cast defaultdict to dict and pickle the source counts
+        # Cast Counter to dict and pickle the source counts
         logger.info("Dumping source counts")
         source_counts = dict(source_counts)
-        with source_counts_fpath.open("wb") as fh:
+        with source_counts_reading_fpath.open("wb") as fh:
             pickle.dump(source_counts, fh)
 
         # Cast defaultdict to dict and pickle the stmt hash to raw stmt ids
@@ -353,6 +425,65 @@ def preassembly(drop_readings: Set, reading_id_to_text_ref_id: Dict):
         stmt_hash_to_raw_stmt_ids = dict(stmt_hash_to_raw_stmt_ids)
         with stmt_hash_to_raw_stmt_ids_fpath.open("wb") as fh:
             pickle.dump(stmt_hash_to_raw_stmt_ids, fh)
+
+
+def merge_processed_statements(kb_mapping: Dict[int, Path]):
+    """Merge processed statements from reading and knowledgebases
+
+    Parameters
+    ----------
+    kb_mapping :
+        A dictionary mapping db_info ids to the local file paths of the
+        statements for that knowledgebase
+    """
+    # kb_file_mapping[db_id] = m.get_local_fpath()
+    # Run bash to concatenate the processed raw statements and the
+    # knowledgebase statements:
+    # $ cat processed_statements.tsv.gz <kb_files> \
+    #   | gzip > all_processed_statements.tsv.gz
+    # todo: come up with name for the merged statements file
+
+    # Combine the source counts and write knowledgebase in: open the
+    # knowledgebase tsv dumps and count lines. Also write to the
+    # raw_id_info_map file.
+    # fixme: we don't have raw statement IDs for
+    #  knowledgebases, so how can that be solved? Using matches hash? The
+    #  raw statement IDs don't have any downstream usage apart from being
+    #  unique identifiers, so just use an unambiguous index, e.g. negative
+    #  integers starting from -min(raw_stmt_id) - 1
+
+    # List the processed statement file to be merged
+    proc_stmts_reading = processed_stmts_reading_fpath.absolute().as_posix()
+    kb_files = [kb_file.absolute().as_posix() for kb_file in kb_mapping.values()]
+    all_files = proc_stmts_reading + " " + " ".join(kb_files)
+
+    # Merge the processed statements
+    if not processed_stmts_fpath.exists():
+        logger.info("Merging processed statements")
+        cmd = f"cat {all_files} | gzip > {processed_stmts_fpath.absolute().as_posix()}"
+        logger.info(f"Running command: {cmd}")
+        os.system(cmd)
+        assert processed_stmts_fpath.exists()
+    else:
+        logger.info(f"Processed statements already merged at "
+                    f"{processed_stmts_fpath.absolute().as_posix()}, skipping...")
+
+    # Merge source counts
+    if not source_counts_fpath.exists():
+        # Open the reading source counts
+        with source_counts_reading_fpath.open("rb") as f:
+            reading_source_counts = pickle.load(f)
+
+        # Open the knowledgebase source counts
+        with source_counts_knowledgebases_fpath.open("rb") as f:
+            kb_source_counts = pickle.load(f)
+
+        # Merge the source counts
+        reading_source_counts.update(kb_source_counts)
+
+        # Dump the merged source counts
+        with source_counts_fpath.open("wb") as f:
+            pickle.dump(reading_source_counts, f)
 
 
 def ground_deduplicate():
@@ -413,7 +544,7 @@ def get_refinement_graph(batch_size: int, num_batches: int) -> nx.DiGraph:
 
     # Open two csv readers to the same file
     if not refinements_fpath.exists():
-        logger.info("Calculating refinements")
+        logger.info("6. Calculating refinements")
         refinements = set()
         # This takes ~9-10 hours to run
         with gzip.open(unique_stmts_fpath, "rt") as fh1:
@@ -474,7 +605,7 @@ def get_refinement_graph(batch_size: int, num_batches: int) -> nx.DiGraph:
             tsv_writer = csv.writer(f, delimiter="\t")
             tsv_writer.writerows(refinements)
     else:
-        logger.info(f"Loading refinements from existing file"
+        logger.info(f"6. Loading refinements from existing file"
                     f"{refinements_fpath.as_posix()}")
         with gzip.open(refinements_fpath.as_posix(), "rt") as f:
             tsv_reader = csv.reader(f, delimiter="\t")
@@ -633,6 +764,11 @@ if __name__ == '__main__':
 
     Time estimate: ~2.5 mins
     """
+    parser = argparse.ArgumentParser("Run the export and assembly pipeline")
+    parser.add_argument("--refresh-kb", action="store_true",
+                        help="If set, overwrite any existing local files "
+                             "with new ones for the knowledgebase statements")
+    args = parser.parse_args()
     logger.info(f"Root data path: {TEMP_DIR}")
 
     # 0. Dump raw data (raw statements, text content + reading, text refs)
@@ -650,31 +786,58 @@ if __name__ == '__main__':
     if not os.environ.get("INDRA_DB_LITE_LOCATION"):
         raise ValueError("Environment variable 'INDRA_DB_LITE_LOCATION' not set")
 
+    # The principal db is needed for the preassembly step as fallback when
+    # the indra_db_lite is missing content
+    from indra_db import get_db
+    db = get_db("primary")
+    if db is None:
+        raise ValueError("Could not connect to principal db")
+
     if len(get_available_models()) == 0:
         raise ValueError(
             "No adeft models detected, run 'python -m adeft.download' to download models"
         )
 
+    # 1. Run knowledge base pipeline if the output files don't exist
+    logger.info("1. Running knowledgebase pipeline")
+    kb_updates = run_kb_pipeline(refresh=args.refresh)
+
     # Check if output from preassembly (step 2) already exists
-    if not processed_stmts_fpath.exists() or not source_counts_fpath.exists():
-        # 1. Distill statements
-        logger.info("1. Running statement distillation")
+    if (
+        not processed_stmts_reading_fpath.exists() or
+        not source_counts_reading_fpath.exists()
+    ):
+        # 2. Distill statements
+        logger.info("2. Running statement distillation")
         readings_to_drop, reading_id_textref_id_map = distill_statements()
 
-        # 2. Preassembly (needs indra_db_lite setup)
-        logger.info("2. Running preassembly")
-        preassembly(drop_readings=readings_to_drop, reading_id_to_text_ref_id=reading_id_textref_id_map)
+        # 3. Preassembly (needs indra_db_lite setup)
+        logger.info("3. Running preassembly")
+        preassembly(
+            drop_readings=readings_to_drop,
+            reading_id_to_text_ref_id=reading_id_textref_id_map,
+            drop_db_info_ids=set(kb_updates.keys()),
+        )
     else:
-        logger.info("Output from step 2 already exists, skipping to step 3...")
+        logger.info(
+            "Output from step 2 & 3 already exists, skipping to step 4..."
+        )
 
-    # 3. Ground and deduplicate statements (here don't discard any statements
+    # 4. Merge the processed raw statements with the knowledgebase statements
+    logger.info(
+        "4. Merging processed knowledgebase statements with processed raw statements"
+    )
+    merge_processed_statements(kb_updates)
+
+    # 5. Ground and deduplicate statements (here don't discard any statements
     #    based on number of agents, as is done in cogex)
-    logger.info("3. Running grounding and deduplication")
+    logger.info("5. Running grounding and deduplication")
     ground_deduplicate()
 
-    # Setup bio ontololgy for preassembler
+    # Steps 6 & 7
     if not refinements_fpath.exists() or not belief_scores_pkl_fpath.exists():
-        logger.info("4. Running setup for refinement calculation")
+        logger.info("6. Running setup for refinement calculation")
+        # Setup bio ontology for pre-assembler
         bio_ontology.initialize()
         bio_ontology._build_transitive_closure()
         pa = Preassembler(bio_ontology)
@@ -688,7 +851,7 @@ if __name__ == '__main__':
 
         batch_count = math.ceil(num_rows / batch_size)
 
-        # 4. Calculate refinement graph:
+        # 6. Calculate refinement graph:
         cycles_found = False
         ref_graph = get_refinement_graph(batch_size=batch_size,
                                          num_batches=batch_count)
@@ -700,8 +863,8 @@ if __name__ == '__main__':
             )
 
         else:
-            # 5. Get belief scores, if there were no refinement cycles
-            logger.info("5. Calculating belief")
+            # 7. Get belief scores, if there were no refinement cycles
+            logger.info("7. Calculating belief")
             calculate_belief(
                 ref_graph, num_batches=batch_count, batch_size=batch_size
             )

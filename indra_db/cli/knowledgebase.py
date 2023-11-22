@@ -4,34 +4,51 @@ __all__ = ['TasManager', 'CBNManager', 'HPRDManager', 'SignorManager',
            'CTDManager', 'VirHostNetManager', 'PhosphoElmManager',
            'DrugBankManager']
 
+import csv
+import gzip
+import json
 import os
 import zlib
+from pathlib import Path
+from typing import Dict, List, Type
+
 import boto3
 import click
 import pickle
 import logging
 import tempfile
-from collections import defaultdict
+from collections import Counter
+
+from indra.util import batch_iter
+from tqdm import tqdm
 
 from indra.statements.validate import assert_valid_statement
+from indra.tools import assemble_corpus as ac
 from indra_db.util import insert_db_stmts
 from indra_db.util.distill_statements import extract_duplicates, KeyFunc
+from indra_db.readonly_dumping.locations import (
+    TEMP_DIR,
+    source_counts_knowledgebases_fpath
+)
 
 from .util import format_date
 
 logger = logging.getLogger(__name__)
 
 
+KB_DIR = TEMP_DIR.joinpath("knowledgebases")
+
+
 class KnowledgebaseManager(object):
     """This is a class to lay out the methods for updating a dataset."""
-    name = NotImplemented
-    short_name = NotImplemented
-    source = NotImplemented
+    name: str = NotImplemented
+    short_name: str = NotImplemented
+    source: str = NotImplemented
 
     def upload(self, db):
         """Upload the content for this dataset into the database."""
         dbid = self._check_reference(db)
-        stmts = self._get_statements()
+        stmts = self.get_statements()
         # Raise any validity issues with statements as exceptions here
         # to avoid uploading invalid content.
         for stmt in stmts:
@@ -48,7 +65,7 @@ class KnowledgebaseManager(object):
         existing_keys = set(db.select_all([db.RawStatements.mk_hash,
                                            db.RawStatements.source_hash],
                                           db.RawStatements.db_info_id == dbid))
-        stmts = self._get_statements()
+        stmts = self.get_statements()
         filtered_stmts = [s for s in stmts
                           if (s.get_hash(), s.evidence[0].get_source_hash())
                           not in existing_keys]
@@ -81,18 +98,31 @@ class KnowledgebaseManager(object):
                           % dbinfo.db_name)
         return dbid
 
-    def _get_statements(self):
+    def get_statements(self, **kwargs):
         raise NotImplementedError("Statement retrieval must be defined in "
                                   "each child.")
+
+    def get_local_fpath(self) -> Path:
+        """Return the local path to the knowledge base file."""
+        if self.short_name == self.source:
+            local_name = self.short_name
+        elif self.short_name in self.source or self.source in self.short_name:
+            # Pick the longer name
+            local_name = self.short_name \
+                if len(self.short_name) > len(self.source) else self.source
+        else:
+            local_name = f"{self.short_name}_{self.source}"
+        return KB_DIR.joinpath(f"processed_stmts_{local_name}.tsv.gz")
 
 
 class TasManager(KnowledgebaseManager):
     """This manager handles retrieval and processing of the TAS dataset."""
+    # TODO: Data is simply a CSV from S3
     name = 'TAS'
     short_name = 'tas'
     source = 'tas'
 
-    def _get_statements(self):
+    def get_statements(self):
         from indra.sources import tas
         # The settings we use here are justified as follows:
         # - only affinities that indicate binding are included
@@ -118,9 +148,16 @@ class SignorManager(KnowledgebaseManager):
     short_name = 'signor'
     source = 'signor'
 
-    def _get_statements(self):
-        from indra.sources.signor import process_from_web
-        proc = process_from_web()
+    def get_statements(self, **kwargs):
+        from indra.sources.signor import process_from_web, process_from_file
+        if kwargs.get("signor_data_file"):
+            data_file = kwargs.pop("signor_data_file")
+            complexes_file = kwargs.pop("signor_complexes_file", None)
+            proc = process_from_file(signor_data_file=data_file,
+                                     signor_complexes_file=complexes_file,
+                                     **kwargs)
+        else:
+            proc = process_from_web()
         return proc.statements
 
 
@@ -130,15 +167,13 @@ class CBNManager(KnowledgebaseManager):
     short_name = 'cbn'
     source = 'bel'
 
-    def __init__(self, archive_url=None):
-        if not archive_url:
-            self.archive_url = ('http://www.causalbionet.com/Content'
-                                '/jgf_bulk_files/Human-2.0.zip')
-        else:
-            self.archive_url = archive_url
-        return
+    def __init__(
+        self,
+        archive_url="https://github.com/pybel/cbn-bel/raw/master/Human-2.0.zip"
+    ):
+        self.archive_url = archive_url
 
-    def _get_statements(self):
+    def get_statements(self):
         import requests
         from zipfile import ZipFile
         from indra.sources.bel.api import process_cbn_jgif_file
@@ -149,6 +184,7 @@ class CBNManager(KnowledgebaseManager):
         logger.info('Retrieving CBN network zip archive')
         tmp_zip = os.path.join(cbn_dir, 'cbn_human.zip')
         resp = requests.get(self.archive_url)
+        resp.raise_for_status()
         with open(tmp_zip, 'wb') as f:
             f.write(resp.content)
 
@@ -159,9 +195,8 @@ class CBNManager(KnowledgebaseManager):
             logger.info('Extracting archive to %s' % tmp_dir)
             zipf.extractall(path=tmp_dir)
             logger.info('Processing jgif files')
-            for jgif in zipf.namelist():
+            for jgif in tqdm(zipf.namelist()):
                 if jgif.endswith('.jgf') or jgif.endswith('.jgif'):
-                    logger.info('Processing %s' % jgif)
                     pbp = process_cbn_jgif_file(os.path.join(tmp_dir, jgif))
                     stmts += pbp.statements
 
@@ -180,7 +215,7 @@ class BiogridManager(KnowledgebaseManager):
     short_name = 'biogrid'
     source = 'biogrid'
 
-    def _get_statements(self):
+    def get_statements(self):
         from indra.sources import biogrid
         bp = biogrid.BiogridProcessor()
         return list(_expanded(bp.statements))
@@ -194,7 +229,7 @@ class PathwayCommonsManager(KnowledgebaseManager):
              'ctd', 'drugbank'}
 
     def __init__(self, *args, **kwargs):
-        self.counts = defaultdict(lambda: 0)
+        self.counts = Counter()
         super(PathwayCommonsManager, self).__init__(*args, **kwargs)
 
     def _can_include(self, stmt):
@@ -207,7 +242,7 @@ class PathwayCommonsManager(KnowledgebaseManager):
 
         return ssid not in self.skips
 
-    def _get_statements(self):
+    def get_statements(self):
         s3 = boto3.client('s3')
 
         logger.info('Loading PC content pickle from S3')
@@ -230,15 +265,12 @@ class CTDManager(KnowledgebaseManager):
     subsets = ['gene_disease', 'chemical_disease',
                'chemical_gene']
 
-    def _get_statements(self):
-        s3 = boto3.client('s3')
+    def get_statements(self):
+        from indra.sources.ctd import process_from_web
         all_stmts = []
-        for subset in self.subsets:
-            logger.info('Fetching CTD subset %s from S3...' % subset)
-            key = 'indra-db/ctd_%s.pkl' % subset
-            resp = s3.get_object(Bucket='bigmech', Key=key)
-            stmts = pickle.loads(resp['Body'].read())
-            all_stmts += [s for s in _expanded(stmts)]
+        for subset in tqdm(self.subsets, desc="CTD subsets"):
+            ctd_processor = process_from_web(subset)
+            all_stmts += [s for s in _expanded(ctd_processor.statements)]
         # Return exactly one of multiple statements that are exactly the same
         # in terms of content and evidence.
         unique_stmts, _ = extract_duplicates(all_stmts,
@@ -251,10 +283,10 @@ class DrugBankManager(KnowledgebaseManager):
     short_name = 'drugbank'
     source = 'drugbank'
 
-    def _get_statements(self):
+    def get_statements(self):
         s3 = boto3.client('s3')
         logger.info('Fetching DrugBank statements from S3...')
-        key = 'indra-db/drugbank_5.1.pkl'
+        key = 'indra-db/drugbank_5.1.10.pkl'
         resp = s3.get_object(Bucket='bigmech', Key=key)
         stmts = pickle.loads(resp['Body'].read())
         expanded_stmts = [s for s in _expanded(stmts)]
@@ -270,7 +302,7 @@ class VirHostNetManager(KnowledgebaseManager):
     short_name = 'vhn'
     source = 'virhostnet'
 
-    def _get_statements(self):
+    def get_statements(self):
         from indra.sources import virhostnet
         vp = virhostnet.process_from_web()
         return [s for s in _expanded(vp.statements)]
@@ -281,7 +313,7 @@ class PhosphoElmManager(KnowledgebaseManager):
     short_name = 'pe'
     source = 'phosphoelm'
 
-    def _get_statements(self):
+    def get_statements(self):
         from indra.sources import phosphoelm
         logger.info('Fetching PhosphoElm dump from S3...')
         s3 = boto3.resource('s3')
@@ -308,7 +340,7 @@ class HPRDManager(KnowledgebaseManager):
     short_name = 'hprd'
     source = 'hprd'
 
-    def _get_statements(self):
+    def get_statements(self):
         import tarfile
         import requests
         from indra.sources import hprd
@@ -316,6 +348,7 @@ class HPRDManager(KnowledgebaseManager):
         # Download the files.
         hprd_base = 'http://www.hprd.org/RELEASE9/'
         resp = requests.get(hprd_base + 'HPRD_FLAT_FILES_041310.tar.gz')
+        resp.raise_for_status()
         tmp_dir = tempfile.mkdtemp('hprd_files')
         tmp_tarfile = os.path.join(tmp_dir, 'hprd_files.tar.gz')
         with open(tmp_tarfile, 'wb') as f:
@@ -330,6 +363,9 @@ class HPRDManager(KnowledgebaseManager):
         for files_dir in dirs:
             if files_dir.startswith('FLAT_FILES'):
                 break
+        else:
+            # Loop doesn't break: FLAT_FILES directory not found
+            raise NotADirectoryError('Could not find FLAT_FILES directory.')
         files_path = os.path.join(tmp_dir, files_dir)
         file_names = {'id_mappings_file': 'HPRD_ID_MAPPINGS',
                       'complexes_file': 'PROTEIN_COMPLEXES',
@@ -356,7 +392,7 @@ class BelLcManager(KnowledgebaseManager):
     short_name = 'bel_lc'
     source = 'bel'
 
-    def _get_statements(self):
+    def get_statements(self):
         from indra.sources import bel
 
         pbp = bel.process_large_corpus()
@@ -375,7 +411,7 @@ class PhosphositeManager(KnowledgebaseManager):
     short_name = 'psp'
     source = 'biopax'
 
-    def _get_statements(self):
+    def get_statements(self):
         from indra.sources import biopax
 
         s3 = boto3.client('s3')
@@ -400,7 +436,7 @@ class RlimspManager(KnowledgebaseManager):
     _rlimsp_files = [('rlims.medline.json', 'pmid'),
                      ('rlims.pmc.json', 'pmcid')]
 
-    def _get_statements(self):
+    def get_statements(self):
         from indra.sources import rlimsp
         import requests
 
@@ -408,8 +444,8 @@ class RlimspManager(KnowledgebaseManager):
         for fname, id_type in self._rlimsp_files:
             print("Processing %s..." % fname)
             res = requests.get(self._rlimsp_root + fname)
-            jsonish_str = res.content.decode('utf-8')
-            rp = rlimsp.process_from_jsonish_str(jsonish_str, id_type)
+            jsonl_str = res.content.decode('utf-8')
+            rp = rlimsp.process_jsonl_str(jsonl_str, id_type)
             stmts += rp.statements
             print("Added %d more statements from %s..."
                   % (len(rp.statements), fname))
@@ -427,13 +463,12 @@ class TrrustManager(KnowledgebaseManager):
     short_name = 'trrust'
     source = 'trrust'
 
-    def _get_statements(self):
+    def get_statements(self):
         from indra.sources import trrust
         tp = trrust.process_from_web()
         unique_stmts, dups = \
             extract_duplicates(_expanded(tp.statements),
                                key_func=KeyFunc.mk_and_one_ev_src)
-        print(len(dups))
         return unique_stmts
 
 
@@ -455,10 +490,10 @@ class DgiManager(KnowledgebaseManager):
     short_name = 'dgi'
     source = 'dgi'
 
-    def _get_statements(self):
+    def get_statements(self):
         from indra.sources import dgi
         logger.info('Processing DGI from web')
-        dp = dgi.process_version('2020-Nov')
+        dp = dgi.process_version()
         logger.info('Expanding evidences and deduplicating')
         filtered_stmts = [s for s in _expanded(dp.statements)]
         unique_stmts, _ = extract_duplicates(filtered_stmts,
@@ -472,7 +507,7 @@ class CrogManager(KnowledgebaseManager):
     short_name = 'crog'
     source = 'crog'
 
-    def _get_statements(self):
+    def get_statements(self):
         from indra.sources import crog
         logger.info('Processing CRoG from web')
         cp = crog.process_from_web()
@@ -489,7 +524,7 @@ class ConibManager(KnowledgebaseManager):
     short_name = 'conib'
     source = 'bel'
 
-    def _get_statements(self):
+    def get_statements(self):
         import pybel
         import requests
         from indra.sources.bel import process_pybel_graph
@@ -522,7 +557,7 @@ class UbiBrowserManager(KnowledgebaseManager):
     short_name = 'ubibrowser'
     source = 'ubibrowser'
 
-    def _get_statements(self):
+    def get_statements(self):
         from indra.sources import ubibrowser
         logger.info('Processing UbiBrowser from web')
         up = ubibrowser.process_from_web()
@@ -533,21 +568,140 @@ class UbiBrowserManager(KnowledgebaseManager):
         return unique_stmts
 
 
+def local_update(
+    kb_manager_list: List[Type[KnowledgebaseManager]],
+    local_files: Dict[str, Dict] = None,
+    refresh: bool = False,
+):
+    """Update the knowledgebases of a local raw statements file dump
+
+    Parameters
+    ----------
+    kb_manager_list :
+        List of the (un-instantiated) classes of the knowledgebase managers
+        to use in update.
+    local_files :
+        Dictionary of local files to use in the update. Keys are the
+        knowledgebase short names, values are kwargs to pass to the
+        knowledgebase manager get_statements method.
+    refresh :
+        If True, the local files will be recreated even if they already exist.
+    """
+    if not kb_manager_list:
+        raise ValueError(
+            "No knowledgebase managers provided, nothing to update"
+        )
+
+    # Get the ids of the knowledgebases to update
+    kbs_to_run = []
+    for kb_manager in kb_manager_list:
+        kbm = kb_manager()
+        # Add the knowledgebase to the list if it is not already there
+        # or if we are refreshing
+        if refresh or not kbm.get_local_fpath().exists():
+            kbs_to_run.append(kb_manager)
+
+    # If there are no knowledgebases to update, we are done
+    if not kbs_to_run:
+        logger.info("No knowledgebases to update")
+        return
+
+    logger.info("Generating statement from the following knowledgebases:")
+    for kb_manager in kbs_to_run:
+        logger.info(f"  {kb_manager.name} ({kb_manager.short_name})")
+
+    source_counts = {}
+    counts = Counter()
+    for ix, Mngr in enumerate(kb_manager_list):
+        kbm = Mngr()
+        logger.info(
+            f"[{ix+1}/{len(kb_manager_list)}] {kbm.name} ({kbm.short_name})"
+        )
+
+        # Write statements for this knowledgebase to a file
+        fname = kbm.get_local_fpath().as_posix()
+        with gzip.open(fname, "wt") as fh:
+            writer = csv.writer(fh, delimiter="\t")
+
+            kb_kwargs = local_files.get(kbm.short_name, {})
+            stmts = kbm.get_statements(**kb_kwargs)
+
+            # Do preassembly
+            if len(stmts) > 100000:
+                stmts_iter = batch_iter(stmts, 100000)
+                batches = True
+                t = tqdm(desc=f"Preassembling {kbm.short_name}",
+                         total=len(stmts)//100000+1)
+            else:
+                stmts_iter = [stmts]
+                batches = False
+                t = None
+                logger.info(f"Preassembling {kbm.short_name}")
+
+            for stmts in stmts_iter:
+                # This part ultimately calls indra_db_lite or the principal db,
+                # depending on which is available
+                stmts = ac.fix_invalidities(stmts, in_place=True)
+                stmts = ac.map_grounding(stmts)
+                stmts = ac.map_sequence(stmts)
+                rows = []
+                for stmt in tqdm(stmts, leave=not batches):
+                    # Get the statement hash and update the source count
+                    stmt_hash = stmt.get_hash(refresh=True)
+
+                    # Get source count for this statement, or create a new one
+                    # if it doesn't exist, and increment the count
+                    source_count_dict = source_counts.get(stmt_hash, Counter())
+                    source_count_dict[kbm.source] += 1
+                    source_counts[stmt_hash] = source_count_dict
+
+                    rows.append((stmt_hash, json.dumps(stmt.to_json())))
+                writer.writerows(rows)
+                if batches:
+                    t.update(1)
+                counts[(kbm.source, kbm.short_name)] += len(stmts)
+        if batches:
+            t.close()
+
+    logger.info("Statements produced per knowledgebase:")
+    for (source, short_name), count in counts.most_common():
+        logger.info(f"  - {source} {short_name}: {count}")
+    logger.info(f"Total rows added: {sum(counts.values())}")
+
+    # Dump source counts
+    with source_counts_knowledgebases_fpath.open("wb") as fh:
+        pickle.dump(source_counts, fh)
+
+
 @click.group()
 def kb():
     """Manage the Knowledge Bases used by the database."""
 
 
 @kb.command()
-@click.argument("task", type=click.Choice(["upload", "update"]))
+@click.argument("task", type=click.Choice(["upload", "update", "local-update"]))
 @click.argument("sources", nargs=-1, type=click.STRING, required=False)
-def run(task, sources):
+def run(
+    task: str,
+    sources: List[str],
+):
     """Upload/update the knowledge bases used by the database.
+
+    Parameters
+    ----------
+    task :
+        The task to perform. One of: upload, update, local-update
+    sources :
+        The knowledge bases to update. If not specified, all knowledge bases
+        will be updated.
 
     \b
     Usage tasks are:
      - upload: use if the knowledge bases have not yet been added.
      - update: if they have been added, but need to be updated.
+     - local-update: if you have a local raw statements file dump, and want
+       to update the knowledge bases from that and create a new raw
+       statements file dump.
 
     Specify which knowledge base sources to update by their name, e.g. "Pathway
     Commons" or "pc". If not specified, all sources will be updated.
@@ -556,28 +710,42 @@ def run(task, sources):
     db = get_db('primary')
 
     # Determine which sources we are working with
-    source_set = None
     if sources:
         source_set = {s.lower() for s in sources}
-    selected_kbs = (M for M in KnowledgebaseManager.__subclasses__()
-                    if not source_set or M.name.lower() in source_set
-                    or M.short_name in source_set)
+        selected_kbs = [
+            M for M in KnowledgebaseManager.__subclasses__()
+            if M.name.lower() in source_set or
+            M.short_name.lower() in source_set
+        ]
+    else:
+        selected_kbs = [KnowledgebaseManager.__subclasses__()]
+
+    # Always skip HPRD: statements already exist in db, the source data hasn't
+    # been updated since 2009 and the server hosting the source data returns
+    # 500 errors when trying to download it
+    selected_kbs = [M for M in selected_kbs if M.short_name != 'hprd']
+
+    logger.info(f"Selected knowledgebases: "
+                f"{', '.join([M.name for M in selected_kbs])}")
 
     # Handle the list option.
     if task == 'list':
         return
 
     # Handle the other tasks.
-    for Manager in selected_kbs:
-        kbm = Manager()
+    logger.info(f"Running {task}...")
+    if task == "local-update":
+        local_update(kb_manager_list=selected_kbs)
+    else:
+        for Manager in selected_kbs:
+            kbm = Manager()
 
-        # Perform the requested action.
-        if task == 'upload':
-            print(f'Uploading {kbm.name}...')
-            kbm.upload(db)
-        elif task == 'update':
-            print(f'Updating {kbm.name}...')
-            kbm.update(db)
+            if task == 'upload':
+                print(f'Uploading {kbm.name}...')
+                kbm.upload(db)
+            elif task == 'update':
+                print(f'Updating {kbm.name}...')
+                kbm.update(db)
 
 
 @kb.command('list')
