@@ -1,5 +1,3 @@
-[![Documentation Status](https://readthedocs.org/projects/indra-db/badge/?version=latest)](https://indra-db.readthedocs.io/en/latest/?badge=latest)
-
 # INDRA DB
 
 <img align="left" src="https://s3.amazonaws.com/bigmech/indra-db/indra_db_logo.png" width="480" height="200" />
@@ -11,6 +9,16 @@ primarily with Amazon Web Services RDS running Postrgres 9+. Used as a backend
 to INDRA, the INDRA Database provides a systematic way of scaling the knowledge
 acquired from other databases, reading, and manual input, and puts that
 knowledge at your fingertips through a direct Python client and a REST api.
+
+### REST API
+
+The INDRA DB is available via a web UI at: https://db.indra.bio
+
+At the same URL, a REST service is also available which allows for programmatic usage
+as documented here: https://github.com/gyorilab/indra_db/blob/master/indra_db_service/README.md
+
+A convenient way to query the INDRA DB is via INDRA's built-in client towards INDRA DB
+which is documented here: https://indra.readthedocs.io/en/latest/modules/sources/indra_db_rest/index.html.
 
 ### Knowledge sources
 

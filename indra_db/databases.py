@@ -18,7 +18,7 @@ from sqlalchemy.sql import expression as sql_expressions
 from sqlalchemy.schema import DropTable
 from sqlalchemy.sql.expression import Delete, Update
 from sqlalchemy.ext.compiler import compiles
-from sqlalchemy.ext.declarative import declarative_base, DeclarativeMeta
+from sqlalchemy.orm import declarative_base, DeclarativeMeta
 from sqlalchemy import create_engine, inspect, UniqueConstraint, func
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.orm.attributes import InstrumentedAttribute
@@ -249,10 +249,11 @@ class DatabaseManager(object):
         # Check to see if the database if available.
         self.available = True
         try:
-            create_engine(
-                self.url,
-                connect_args={'connect_timeout': 1}
-            ).execute('SELECT 1 AS ping;')
+            with create_engine(
+                    self.url,
+                    connect_args={'connect_timeout': 1}
+            ).connect() as connection:
+                connection.execute('SELECT 1 AS ping;')
         except Exception as err:
             logger.warning(f"Database {repr(self.url)} is not available: {err}")
             self.available = False
@@ -502,17 +503,18 @@ class DatabaseManager(object):
             raise
 
     def commit_copy(self, err_msg):
-        if self._conn is not None:
-            try:
-                logger.debug('Attempting to commit...')
-                self._conn.commit()
-                self._conn = None
-                logger.debug('Message committed.')
-            except Exception as e:
-                self._conn = None
-                logger.exception(e)
-                logger.error(err_msg)
-                raise
+        if not self._conn:
+            raise Exception("No connection, cannot commit")
+        try:
+            logger.debug('Attempting to commit...')
+            self._conn.commit()
+            logger.debug('Message committed.')
+        except Exception:
+            logger.exception(err_msg)
+            raise
+        finally:
+            self._conn = None
+
 
     def _get_foreign_key_constraint(self, table_name_1, table_name_2):
         cols = self.get_column_objects(self.tables[table_name_1])

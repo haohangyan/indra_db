@@ -393,6 +393,7 @@ def get_statements(result_type, method):
 
 
 @app.route("/expand", methods=["POST"])
+@jwt_nontest_optional
 def expand_meta_row():
     # Used in AgentPair.vue when an "agent pair" is expanded and that level
     # of data needs to be fetched.
