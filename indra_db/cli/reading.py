@@ -155,7 +155,7 @@ class BulkReadingManager(ReadingManager):
         return True
 
     @ReadingManager._run_all_readers
-    def read_new(self, db, reader_name):
+    def read_new(self, db, reader_name, start_date, end_date):
         """Update the readings and raw statements in the database."""
         from indra_reading.readers import get_reader_class
 
@@ -171,9 +171,10 @@ class BulkReadingManager(ReadingManager):
 
         tcid_q = db.filter_query(
             db.TextContent.id,
-            db.TextContent.insert_date > self.begin_datetime,
+            (db.TextContent.insert_date > start_date) & (
+                        db.TextContent.insert_date < end_date),
             *constraints
-            ).limit(500)
+            )
         if self.only_unread:
             reader_class = get_reader_class(reader_name)
             reader_version = reader_class.get_version()
@@ -181,7 +182,7 @@ class BulkReadingManager(ReadingManager):
                 db.filter_query(db.Reading.text_content_id,
                                 db.Reading.reader == reader_name,
                                 db.Reading.reader_version == reader_version)
-            ).limit(500)
+            )
         tcids = {tcid for tcid, in tcid_q.all()}
         if not tcids:
             logger.info("Nothing new to read with %s." % reader_name)
@@ -352,7 +353,11 @@ def reading():
 @click.option('--project-name', type=str,
               help="Set the project name to be different from the config "
                    "default.")
-def run(task, buffer, project_name):
+@click.option('--start-date', type=click.DateTime(formats=["%Y-%m-%d"]),
+              help="Start date for filtering content (format: YYYY-MM-DD).")
+@click.option('--end-date', type=click.DateTime(formats=["%Y-%m-%d"]),
+              help="End date for filtering content (format: YYYY-MM-DD).")
+def run(task, buffer, project_name, start_date, end_date):
     """Manage the the reading of text content on AWS.
 
     \b
@@ -363,14 +368,14 @@ def run(task, buffer, project_name):
     from indra_db.util import get_db
     db = get_db('primary')
     #readers = ['SPARSER', 'REACH', 'EIDOS', 'TRIPS', 'ISI', 'MTI']
-    readers = ['SPARSER', 'REACH', 'EIDOS', 'TRIPS']
+    readers = ['SPARSER']#, 'REACH', 'EIDOS', 'TRIPS']
     bulk_manager = BulkAwsReadingManager(readers,
                                          buffer_days=buffer,
                                          project_name=project_name)
     if task == 'all':
         bulk_manager.read_all(db)
     elif task == 'new':
-        bulk_manager.read_new(db)
+        bulk_manager.read_new(db, start_date, end_date)
 
 
 @reading.command()
