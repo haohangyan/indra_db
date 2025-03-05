@@ -155,7 +155,7 @@ class BulkReadingManager(ReadingManager):
         return True
 
     @ReadingManager._run_all_readers
-    def read_new(self, db, reader_name, start_date, end_date):
+    def read_new(self, db, reader_name):
         """Update the readings and raw statements in the database."""
         from indra_reading.readers import get_reader_class
 
@@ -171,8 +171,7 @@ class BulkReadingManager(ReadingManager):
 
         tcid_q = db.filter_query(
             db.TextContent.id,
-            (db.TextContent.insert_date > start_date) & (
-                        db.TextContent.insert_date < end_date),
+            db.TextContent.insert_date > '2024-08-12',
             *constraints
             )
         if self.only_unread:
@@ -353,11 +352,7 @@ def reading():
 @click.option('--project-name', type=str,
               help="Set the project name to be different from the config "
                    "default.")
-@click.option('--start-date', type=click.DateTime(formats=["%Y-%m-%d"]),
-              help="Start date for filtering content (format: YYYY-MM-DD).")
-@click.option('--end-date', type=click.DateTime(formats=["%Y-%m-%d"]),
-              help="End date for filtering content (format: YYYY-MM-DD).")
-def run(task, buffer, project_name, start_date, end_date):
+def run(task, buffer, project_name):
     """Manage the the reading of text content on AWS.
 
     \b
@@ -375,7 +370,7 @@ def run(task, buffer, project_name, start_date, end_date):
     if task == 'all':
         bulk_manager.read_all(db)
     elif task == 'new':
-        bulk_manager.read_new(db, start_date, end_date)
+        bulk_manager.read_new(db)
 
 
 @reading.command()
