@@ -168,24 +168,25 @@ class BulkReadingManager(ReadingManager):
                                      "Please run_all." % reader_name)
 
         constraints = self._get_constraints(db, reader_name)
-
-        tcid_q = db.filter_query(
-            db.TextContent.id,
-            db.TextContent.insert_date > '2024-08-12',
-            *constraints
-            )
-        if self.only_unread:
-            reader_class = get_reader_class(reader_name)
-            reader_version = reader_class.get_version()
-            tcid_q = tcid_q.except_(
-                db.filter_query(db.Reading.text_content_id,
-                                db.Reading.reader == reader_name,
-                                db.Reading.reader_version == reader_version)
-            )
-        tcids = {tcid for tcid, in tcid_q.all()}
-        if not tcids:
-            logger.info("Nothing new to read with %s." % reader_name)
-            return False
+        #
+        # tcid_q = db.filter_query(
+        #     db.TextContent.id,
+        #     db.TextContent.insert_date > '2024-08-12',
+        #     *constraints
+        #     )
+        # if self.only_unread:
+        #     reader_class = get_reader_class(reader_name)
+        #     reader_version = reader_class.get_version()
+        #     tcid_q = tcid_q.except_(
+        #         db.filter_query(db.Reading.text_content_id,
+        #                         db.Reading.reader == reader_name,
+        #                         db.Reading.reader_version == reader_version)
+        #     )
+        # tcids = {tcid for tcid, in tcid_q.all()}
+        # if not tcids:
+        #     logger.info("Nothing new to read with %s." % reader_name)
+        #     return False
+        tcids = None
         self._run_reading(db, tcids, reader_name)
         return True
 
@@ -325,11 +326,21 @@ class BulkLocalReadingManager(BulkReadingManager):
     def _run_reading(self, db, tcids, reader_name):
         from indra_db.reading import read_db as rdb
         ids_per_job = 5000
-        if len(tcids) > ids_per_job:
-            raise ReadingUpdateError("Too many id's to run locally. Try "
-                                     "running on batch (use_batch).")
-        logger.info("Producing readings locally for %d new text refs."
-                    % len(tcids))
+        # if len(tcids) > ids_per_job:
+        #     raise ReadingUpdateError("Too many id's to run locally. Try "
+        #                              "running on batch (use_batch).")
+        # logger.info("Producing readings locally for %d new text refs."
+        #             % len(tcids))
+        import boto3
+        bucket_name = "bigmech"
+        file_key = "reading_results/sparser_reading/bulk_uploading/all_tcids.txt"
+        s3 = boto3.client("s3")
+        response = s3.get_object(Bucket=bucket_name, Key=file_key)
+        content = response["Body"].read().decode("utf-8")
+
+        tcids = [int(line.strip()) for line in content.splitlines()
+                        if line.strip().isdigit() and 1301001 <= int(
+                line.strip()) <= 1302001]
         base_dir = path.join(THIS_DIR, 'read_all_%s' % reader_name)
         readers = rdb.construct_readers([reader_name], base_dir=base_dir,
                                         n_proc=self.n_proc)
