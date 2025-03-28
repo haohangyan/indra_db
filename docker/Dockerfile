@@ -14,6 +14,8 @@ RUN cd indra && \
     echo "INDRA_BRANCH=" $INDRA_BRANCH && \
     pip install -e . -U
 
+RUN python -m indra.ontology.bio build
+
 # Install libpq5 and some other necessities.
 RUN wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | apt-key add - && \
     apt-get update && \
