@@ -12,7 +12,7 @@ RUN cd indra && \
     git fetch --all && \
     git checkout $INDRA_BRANCH && \
     echo "INDRA_BRANCH=" $INDRA_BRANCH && \
-    pip install -e . -U \
+    pip install -e . -U && \
     python -m indra.ontology.bio build
 
 # Install libpq5 and some other necessities.
