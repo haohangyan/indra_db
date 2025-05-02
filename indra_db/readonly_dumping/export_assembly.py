@@ -20,6 +20,7 @@ import networkx as nx
 import numpy as np
 import pandas
 import psutil
+from indra.belief.skl import HybridScorer
 from tqdm import tqdm
 import os
 
@@ -645,6 +646,7 @@ def calculate_belief(
 
     # Initialize a belief engine
     logger.info("Initializing belief engine")
+    scorer = HybridScorer()
     be = BeliefEngine(refinements_graph=refinements_graph)
 
     # Load the source counts
@@ -715,7 +717,6 @@ def calculate_belief(
 def process_batch_pair(file):
     sqlite_ontology = SqliteOntology(
         db_path=sql_ontology_db_fpath.absolute().as_posix())
-    sqlite_ontology.initialize()
     pa = Preassembler(sqlite_ontology)
     file1, file2 = file
     stmts1 = load_statements_from_file(file1)
@@ -736,7 +737,6 @@ def get_related(stmts: StmtList, pa: Preassembler) -> Set[Tuple[int, int]]:
 def parallel_process_files(split_files, num_processes = 1):
     sqlite_ontology = SqliteOntology(
         db_path=sql_ontology_db_fpath.absolute().as_posix())
-    sqlite_ontology.initialize()
     pa = Preassembler(sqlite_ontology)
     split_files = split_files[::-1]
     tasks = []
@@ -822,7 +822,6 @@ def get_refinement_graph(n_rows: int, split_files: list) -> nx.DiGraph:
     logger.info("Checking refinements")
     sqlite_ontology = SqliteOntology(
         db_path=sql_ontology_db_fpath.absolute().as_posix())
-    sqlite_ontology.initialize()
     pa = Preassembler(sqlite_ontology)
     sample_stmts = sample_unique_stmts(n_rows=n_rows)
     sample_refinements = get_related([s for _, s in sample_stmts], pa=pa)
