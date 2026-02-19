@@ -10,7 +10,7 @@ from flask_cors import CORS
 from flask_compress import Compress
 from flask import url_for as base_url_for
 from jinja2 import Environment, ChoiceLoader
-from flask_jwt_extended import get_jwt_identity
+from flask_jwt_extended import get_jwt_identity, verify_jwt_in_request
 from flask import Flask, request, abort, Response, redirect, jsonify
 
 from indra.statements import get_all_descendants, Statement
@@ -169,6 +169,7 @@ def render_my_template(template, title, **kwargs):
     """Render a Jinja2 template wrapping in identity and other details."""
     kwargs["title"] = TITLE + ": " + title
     if not TESTING["status"]:
+        verify_jwt_in_request(optional=True)
         kwargs["identity"] = get_jwt_identity()
 
     # Set nav elements as inactive by default.
