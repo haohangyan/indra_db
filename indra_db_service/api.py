@@ -13,7 +13,7 @@ from jinja2 import Environment, ChoiceLoader
 from flask_jwt_extended import get_jwt_identity, verify_jwt_in_request
 from flask import Flask, request, abort, Response, redirect, jsonify
 
-from indra.statements import get_all_descendants, Statement
+from indra.statements import get_all_descendants, Statement, Event, Influence, Association, Unresolved
 from indra.assemblers.html.assembler import (
     loader as indra_loader,
     SOURCE_INFO,
@@ -207,9 +207,12 @@ def ground():
 @jwt_nontest_optional
 @user_log_endpoint
 def search():
-    stmt_types = {c.__name__ for c in get_all_descendants(Statement)}
-    stmt_types -= {"Influence", "Event", "Unresolved"}
-    stmt_types_json = json.dumps(sorted(list(stmt_types)))
+    stmt_classes = set(get_all_descendants(Statement))
+    non_biology_roots = {Event, Influence, Association, Unresolved}
+    non_biology_classes = set(non_biology_roots)
+    for root in non_biology_roots:
+        non_biology_classes |= set(get_all_descendants(root))
+    stmt_types_json = json.dumps(sorted(c.__name__ for c in stmt_classes - non_biology_classes))
     if TESTING["status"]:
         if not TESTING["deployment"]:
             vue_src = url_for("serve_indralab_vue", file="IndralabVue.umd.js")
