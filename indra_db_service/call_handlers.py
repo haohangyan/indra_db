@@ -5,6 +5,8 @@ __all__ = ['ApiCall', 'FromAgentsApiCall', 'FromHashApiCall',
 import sys
 import json
 import logging
+import sqlite3
+from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
 
@@ -31,6 +33,37 @@ from indra_db_service.util import LogTracker, sec_since, get_source,\
     _make_english_from_meta
 
 logger = logging.getLogger('call_handlers')
+
+LLM_CURATION_DB_PATH = \
+    Path.home() / 'Downloads' / 'evidence_llm.sqlite'
+
+
+def add_llm_verifications(results, database_path=LLM_CURATION_DB_PATH):
+    """Attach stored LLM curations to statement evidence JSON."""
+    if not database_path.is_file():
+        return
+
+    try:
+        database_uri = f'file:{database_path}?mode=ro'
+        with sqlite3.connect(database_uri, uri=True) as connection:
+            for statement_hash, statement in results.items():
+                for evidence in statement['evidence']:
+                    row = connection.execute(
+                        """
+                        SELECT judgment, error_category, explanation
+                        FROM llm_evidence_curation
+                        WHERE statement_hash = ? AND source_hash = ?
+                        """,
+                        (int(statement_hash), int(evidence['source_hash'])),
+                    ).fetchone()
+                    if row:
+                        evidence['llm_verification'] = {
+                            'verdict': row[0],
+                            'error_category': row[1],
+                            'explanation': row[2],
+                        }
+    except sqlite3.Error as error:
+        logger.warning("Could not read LLM curation database: %s", error)
 
 
 rev_source_mapping = {v: k for k, v in internal_source_mappings.items()}
@@ -355,6 +388,7 @@ class StatementApiCall(ApiCall):
 
     def produce_response(self, result):
         if result.result_type == 'statements':
+            add_llm_verifications(result.results)
             res_json = result.json()
 
             # Add derived values to the res_json.
