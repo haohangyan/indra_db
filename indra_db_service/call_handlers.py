@@ -34,8 +34,9 @@ from indra_db_service.util import LogTracker, sec_since, get_source,\
 
 logger = logging.getLogger('call_handlers')
 
-LLM_CURATION_DB_PATH = \
-    Path.home() / 'Downloads' / 'evidence_llm.sqlite'
+LLM_CURATION_DB_PATH = Path('/data/indra_db/evidence_llm.sqlite')
+if not LLM_CURATION_DB_PATH.is_file():
+    LLM_CURATION_DB_PATH = Path.home() / 'Downloads' / 'evidence_llm.sqlite'
 
 
 def add_llm_verifications(results, database_path=LLM_CURATION_DB_PATH):
