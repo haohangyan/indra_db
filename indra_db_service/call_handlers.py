@@ -1,6 +1,7 @@
 __all__ = ['ApiCall', 'FromAgentsApiCall', 'FromHashApiCall',
            'FromHashesApiCall', 'FromPapersApiCall', 'FromSimpleJsonApiCall',
-           'FromAgentJsonApiCall', 'DirectQueryApiCall', 'pop_request_bool']
+           'FromAgentJsonApiCall', 'DirectQueryApiCall', 'pop_request_bool',
+           'add_llm_relation_correctness']
 
 import sys
 import json
@@ -34,9 +35,38 @@ from indra_db_service.util import LogTracker, sec_since, get_source,\
 
 logger = logging.getLogger('call_handlers')
 
-LLM_CURATION_DB_PATH = Path('/data/indra_db/evidence_llm.sqlite')
+LLM_CURATION_DB_PATH = Path('/data/indra_db/evidence_llm_20261005.sqlite')
 if not LLM_CURATION_DB_PATH.is_file():
-    LLM_CURATION_DB_PATH = Path.home() / 'Downloads' / 'evidence_llm.sqlite'
+    LLM_CURATION_DB_PATH = Path.home() / 'Downloads' / 'evidence_llm_20261005.sqlite'
+
+
+def _get_llm_statement_scores(connection, statement_hashes):
+    """Return stored correctness counts keyed by statement hash."""
+    has_statement_scores = connection.execute(
+        """
+        SELECT 1 FROM sqlite_master
+        WHERE type = 'table' AND name = 'llm_statement_correctness'
+        """
+    ).fetchone()
+    if not has_statement_scores:
+        return {}
+
+    scores = {}
+    statement_hashes = list({int(h) for h in statement_hashes})
+    for start in range(0, len(statement_hashes), 900):
+        batch = statement_hashes[start:start + 900]
+        placeholders = ','.join('?' for _ in batch)
+        rows = connection.execute(
+            f"""
+            SELECT statement_hash, correct_count, total_count,
+                   correctness_percent
+            FROM llm_statement_correctness
+            WHERE statement_hash IN ({placeholders})
+            """,
+            batch,
+        )
+        scores.update({row[0]: row[1:] for row in rows})
+    return scores
 
 
 def add_llm_verifications(results, database_path=LLM_CURATION_DB_PATH):
@@ -47,7 +77,15 @@ def add_llm_verifications(results, database_path=LLM_CURATION_DB_PATH):
     try:
         database_uri = f'file:{database_path}?mode=ro'
         with sqlite3.connect(database_uri, uri=True) as connection:
+            scores = _get_llm_statement_scores(connection, results)
             for statement_hash, statement in results.items():
+                score = scores.get(int(statement_hash))
+                if score:
+                    statement['llm_correctness'] = {
+                        'correct_count': score[0],
+                        'total_count': score[1],
+                        'percent': score[2],
+                    }
                 for evidence in statement['evidence']:
                     row = connection.execute(
                         """
@@ -65,6 +103,43 @@ def add_llm_verifications(results, database_path=LLM_CURATION_DB_PATH):
                         }
     except sqlite3.Error as error:
         logger.warning("Could not read LLM curation database: %s", error)
+
+
+def add_llm_relation_correctness(results,
+                                 database_path=LLM_CURATION_DB_PATH):
+    """Attach evidence-weighted correctness to grouped relations."""
+    if not database_path.is_file():
+        return
+
+    relation_hashes = {}
+    all_hashes = set()
+    for key, relation in results.items():
+        hashes = relation.get('hashes')
+        if hashes is None and relation.get('hash') is not None:
+            hashes = [relation['hash']]
+        hashes = tuple({int(statement_hash) for statement_hash in hashes or []})
+        relation_hashes[key] = hashes
+        all_hashes.update(hashes)
+
+    if not all_hashes:
+        return
+
+    try:
+        database_uri = f'file:{database_path}?mode=ro'
+        with sqlite3.connect(database_uri, uri=True) as connection:
+            scores = _get_llm_statement_scores(connection, all_hashes)
+
+        for key, hashes in relation_hashes.items():
+            correct_count = sum(scores[h][0] for h in hashes if h in scores)
+            total_count = sum(scores[h][1] for h in hashes if h in scores)
+            if total_count:
+                results[key]['llm_correctness'] = {
+                    'correct_count': correct_count,
+                    'total_count': total_count,
+                    'percent': round(100 * correct_count / total_count, 2),
+                }
+    except sqlite3.Error as error:
+        logger.warning("Could not read LLM statement scores: %s", error)
 
 
 rev_source_mapping = {v: k for k, v in internal_source_mappings.items()}
@@ -450,6 +525,9 @@ class StatementApiCall(ApiCall):
                            sys.getsizeof(resp.data) / 1e6,
                            sec_since(self.start_time)))
         elif result.result_type != 'hashes':
+            if result.result_type in {'agents', 'relations'}:
+                add_llm_relation_correctness(result.results)
+
             # Look up curations, if result with_curations was set.
             if self.w_cur_counts:
                 rel_hash_lookup = defaultdict(list)

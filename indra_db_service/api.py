@@ -500,6 +500,8 @@ def expand_meta_row():
             for entry in entry_hash_lookup[cur["pa_hash"]]:
                 entry["cur_count"] += 1
 
+    add_llm_relation_correctness(result.results)
+
     res_json = result.json()
     res_json["relations"] = list(res_json["results"].values())
     res_json.pop("results")
