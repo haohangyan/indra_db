@@ -113,7 +113,11 @@ def get_llm_verifications(statement_hashes, include_explanations=False,
 
     statement_hashes = list(dict.fromkeys(int(h) for h in statement_hashes))
     results = {
-        str(statement_hash): {'correctness': None, 'verifications': []}
+        str(statement_hash): {
+            'statement': None,
+            'correctness': None,
+            'verifications': [],
+        }
         for statement_hash in statement_hashes
     }
 
@@ -128,7 +132,8 @@ def get_llm_verifications(statement_hashes, include_explanations=False,
                     'percent': score[2],
                 }
 
-            fields = ('statement_hash, source_hash, judgment, error_category'
+            fields = ('statement_hash, source_hash, statement, evidence_text, '
+                      'judgment, error_category'
                       + (', explanation' if include_explanations else ''))
             for start in range(0, len(statement_hashes), 900):
                 batch = statement_hashes[start:start + 900]
@@ -143,14 +148,18 @@ def get_llm_verifications(statement_hashes, include_explanations=False,
                     batch,
                 )
                 for row in rows:
+                    statement_result = results[str(row[0])]
+                    if statement_result['statement'] is None:
+                        statement_result['statement'] = row[2]
                     verification = {
                         'source_hash': str(row[1]),
-                        'judgment': row[2],
-                        'error_category': row[3],
+                        'evidence_text': row[3],
+                        'judgment': row[4],
+                        'error_category': row[5],
                     }
                     if include_explanations:
-                        verification['explanation'] = row[4]
-                    results[str(row[0])]['verifications'].append(verification)
+                        verification['explanation'] = row[6]
+                    statement_result['verifications'].append(verification)
     except sqlite3.Error as error:
         logger.warning("Could not read LLM curation database: %s", error)
         return None
