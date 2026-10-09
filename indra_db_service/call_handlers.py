@@ -1,7 +1,7 @@
 __all__ = ['ApiCall', 'FromAgentsApiCall', 'FromHashApiCall',
            'FromHashesApiCall', 'FromPapersApiCall', 'FromSimpleJsonApiCall',
            'FromAgentJsonApiCall', 'DirectQueryApiCall', 'pop_request_bool',
-           'add_llm_relation_correctness']
+           'add_llm_relation_correctness', 'get_llm_verifications']
 
 import sys
 import json
@@ -103,6 +103,61 @@ def add_llm_verifications(results, database_path=LLM_CURATION_DB_PATH):
                         }
     except sqlite3.Error as error:
         logger.warning("Could not read LLM curation database: %s", error)
+
+
+def get_llm_verifications(statement_hashes, include_explanations=False,
+                          database_path=LLM_CURATION_DB_PATH):
+    """Return LLM evidence verifications grouped by statement hash."""
+    if not database_path.is_file():
+        return None
+
+    statement_hashes = list(dict.fromkeys(int(h) for h in statement_hashes))
+    results = {
+        str(statement_hash): {'correctness': None, 'verifications': []}
+        for statement_hash in statement_hashes
+    }
+
+    try:
+        database_uri = f'file:{database_path}?mode=ro'
+        with sqlite3.connect(database_uri, uri=True) as connection:
+            scores = _get_llm_statement_scores(connection, statement_hashes)
+            for statement_hash, score in scores.items():
+                results[str(statement_hash)]['correctness'] = {
+                    'correct_count': score[0],
+                    'total_count': score[1],
+                    'percent': score[2],
+                }
+
+            fields = ('statement_hash, source_hash, judgment, error_category'
+                      + (', explanation' if include_explanations else ''))
+            for start in range(0, len(statement_hashes), 900):
+                batch = statement_hashes[start:start + 900]
+                placeholders = ','.join('?' for _ in batch)
+                rows = connection.execute(
+                    f"""
+                    SELECT {fields}
+                    FROM llm_evidence_curation
+                    WHERE statement_hash IN ({placeholders})
+                    ORDER BY statement_hash, source_hash
+                    """,
+                    batch,
+                )
+                for row in rows:
+                    verification = {
+                        'source_hash': str(row[1]),
+                        'judgment': row[2],
+                        'error_category': row[3],
+                    }
+                    if include_explanations:
+                        verification['explanation'] = row[4]
+                    results[str(row[0])]['verifications'].append(verification)
+    except sqlite3.Error as error:
+        logger.warning("Could not read LLM curation database: %s", error)
+        return None
+
+    missing = [statement_hash for statement_hash, result in results.items()
+               if result['correctness'] is None and not result['verifications']]
+    return {'statements': results, 'missing': missing}
 
 
 def add_llm_relation_correctness(results,
